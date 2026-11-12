@@ -300,6 +300,99 @@ class TestPyJWKClient:
 
         assert repeated_call.call_count == 1
 
+    def test_signing_key_cache_retires_revoked_key_with_jwk_set(self) -> None:
+        # Regression: with ``cache_keys=True`` the per-key LRU cache had no
+        # invalidation hook, so a key revoked at the JWKS endpoint kept
+        # verifying tokens until the process restarted. A cached signing
+        # key must expire with the JWK Set it came from.
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        rotated_kid = "MLYHNMMhwCNXw9roHIILFsK4nLs="
+        jwks_client = PyJWKClient(url, cache_keys=True, lifespan=300)
+
+        payload = [RESPONSE_DATA_WITH_MATCHING_KID]
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            opener = mock.Mock()
+            build_opener_mock.return_value = opener
+            response = mock.Mock()
+            response.__enter__ = mock.Mock(return_value=response)
+            response.__exit__ = mock.Mock()
+            response.read.side_effect = lambda: json.dumps(payload[0])
+            opener.open.return_value = response
+
+            clock = [0.0]
+            with mock.patch(
+                "jwt.jwks_client.time.monotonic", side_effect=lambda: clock[0]
+            ):
+                assert jwks_client.get_signing_key(kid).key_id == kid
+                assert opener.open.call_count == 1
+
+                # The key is revoked at the endpoint, but the JWK Set cache
+                # is still valid: the cached key is served without a fetch.
+                payload[0] = RESPONSE_DATA_NO_MATCHING_KID
+                clock[0] = 100.0
+                assert jwks_client.get_signing_key(kid).key_id == kid
+                assert opener.open.call_count == 1
+
+                # Once the JWK Set cache expires, the revoked key must not
+                # be served anymore, no matter how often it is requested.
+                clock[0] = 301.0
+                with pytest.raises(PyJWKClientError, match="matches"):
+                    jwks_client.get_signing_key(kid)
+                assert opener.open.call_count == 2
+
+                # The key that replaced it resolves from the fresh JWK Set.
+                assert jwks_client.get_signing_key(rotated_kid).key_id == rotated_kid
+
+    def test_signing_key_cache_cleared_on_forced_refresh(self) -> None:
+        # A forced refresh of the JWK Set must invalidate cached signing
+        # keys immediately, not only after the cache lifespan expires.
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        jwks_client = PyJWKClient(url, cache_keys=True)
+
+        payload = [RESPONSE_DATA_WITH_MATCHING_KID]
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            opener = mock.Mock()
+            build_opener_mock.return_value = opener
+            response = mock.Mock()
+            response.__enter__ = mock.Mock(return_value=response)
+            response.__exit__ = mock.Mock()
+            response.read.side_effect = lambda: json.dumps(payload[0])
+            opener.open.return_value = response
+
+            assert jwks_client.get_signing_key(kid).key_id == kid
+
+            payload[0] = RESPONSE_DATA_NO_MATCHING_KID
+            jwks_client.get_jwk_set(refresh=True)
+
+            with pytest.raises(PyJWKClientError, match="matches"):
+                jwks_client.get_signing_key(kid)
+
+        assert opener.open.call_count == 2
+
+    def test_signing_key_cache_not_used_when_jwk_set_cache_disabled(self) -> None:
+        # With ``cache_jwk_set=False`` there is no cached JWK Set to anchor
+        # key validity to, so every lookup resolves against the endpoint
+        # even when ``cache_keys=True``.
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        jwks_client = PyJWKClient(url, cache_keys=True, cache_jwk_set=False)
+
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            opener = mock.Mock()
+            build_opener_mock.return_value = opener
+            response = mock.Mock()
+            response.__enter__ = mock.Mock(return_value=response)
+            response.__exit__ = mock.Mock()
+            response.read.return_value = json.dumps(RESPONSE_DATA_WITH_MATCHING_KID)
+            opener.open.return_value = response
+
+            assert jwks_client.get_signing_key(kid).key_id == kid
+            assert jwks_client.get_signing_key(kid).key_id == kid
+
+        assert opener.open.call_count == 2
+
     def test_get_signing_key_from_jwt(self) -> None:
         token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImtpZCI6Ik5FRTFRVVJCT1RNNE16STVSa0ZETlRZeE9UVTFNRGcyT0Rnd1EwVXpNVGsxUWpZeVJrUkZRdyJ9.eyJpc3MiOiJodHRwczovL2Rldi04N2V2eDlydS5hdXRoMC5jb20vIiwic3ViIjoiYVc0Q2NhNzl4UmVMV1V6MGFFMkg2a0QwTzNjWEJWdENAY2xpZW50cyIsImF1ZCI6Imh0dHBzOi8vZXhwZW5zZXMtYXBpIiwiaWF0IjoxNTcyMDA2OTU0LCJleHAiOjE1NzIwMDY5NjQsImF6cCI6ImFXNENjYTc5eFJlTFdVejBhRTJINmtEME8zY1hCVnRDIiwiZ3R5IjoiY2xpZW50LWNyZWRlbnRpYWxzIn0.PUxE7xn52aTCohGiWoSdMBZGiYAHwE5FYie0Y1qUT68IHSTXwXVd6hn02HTah6epvHHVKA2FqcFZ4GGv5VTHEvYpeggiiZMgbxFrmTEY0csL6VNkX1eaJGcuehwQCRBKRLL3zKmA5IKGy5GeUnIbpPHLHDxr-GXvgFzsdsyWlVQvPX2xjeaQ217r2PtxDeqjlf66UYl6oY6AqNS8DH3iryCvIfCcybRZkc_hdy-6ZMoKT6Piijvk_aXdm7-QQqKJFHLuEqrVSOuBqqiNfVrG27QzAPuPOxvfXTVLXL2jek5meH6n-VWgrBdoMFH93QEszEDowDAEhQPHVs0xj7SIzA"
         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"

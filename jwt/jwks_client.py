@@ -6,6 +6,7 @@ import math
 import threading
 import time
 import urllib.request
+from collections.abc import Callable
 from functools import lru_cache
 from ssl import SSLContext
 from typing import Any
@@ -69,13 +70,19 @@ class PyJWKClient:
 
         **Tier 2 — Signing key cache** (disabled by default):
         Caches individual signing keys (looked up by ``kid``) using an LRU
-        cache with **no time-based expiration**. Keys are evicted only when
-        the cache reaches its maximum size. Controlled by:
+        cache. A cached key is served only while the JWK Set it came from
+        is still valid: entries are keyed to the current cached JWK Set
+        and dropped on every successful fetch, so a key removed from the
+        endpoint (rotation or revocation) stops being served once the
+        JWK Set cache expires. Controlled by:
 
         - ``cache_keys``: Set to ``True`` to enable this cache.
           Defaults to ``False``.
         - ``max_cached_keys``: Maximum number of signing keys to keep in
           the LRU cache. Defaults to ``16``.
+
+        When ``cache_jwk_set`` is ``False`` there is no cached JWK Set to
+        anchor key validity to, so signing keys are not cached.
 
         :param uri: The URL of the JWKS endpoint.
         :type uri: str
@@ -126,6 +133,10 @@ class PyJWKClient:
         self.cooldown_duration = cooldown_duration
         self._last_successful_fetch: float | None = None
         self._client_lock = threading.RLock()
+        # Bumped on every successful fetch; signing key cache entries are
+        # keyed to it so they cannot outlive the JWK Set they came from.
+        self._jwk_set_generation = 0
+        self._signing_key_cache: Callable[[str, int], PyJWK] | None = None
 
         if cache_jwk_set:
             # Init jwt set cache with default or given lifespan.
@@ -139,10 +150,11 @@ class PyJWKClient:
             self.jwk_set_cache = None
 
         if cache_keys:
-            # Cache signing keys
-            get_signing_key = lru_cache(maxsize=max_cached_keys)(self.get_signing_key)
-            # Ignore mypy (https://github.com/python/mypy/issues/2427)
-            self.get_signing_key = get_signing_key  # type: ignore[method-assign]
+            # Cache signing keys, keyed by kid and the JWK Set generation
+            # they were resolved from.
+            self._signing_key_cache = lru_cache(maxsize=max_cached_keys)(
+                self._resolve_signing_key_cached
+            )
 
     def fetch_data(self) -> Any:
         """Fetch the JWK Set from the JWKS endpoint.
@@ -185,6 +197,12 @@ class PyJWKClient:
         if self.jwk_set_cache is not None:
             self.jwk_set_cache.put(jwk_set)
         self._last_successful_fetch = time.monotonic()
+        # A fresh JWK Set invalidates cached signing keys: a key removed
+        # at the endpoint (rotation or revocation) must stop being served
+        # instead of lingering in the LRU cache until a restart.
+        self._jwk_set_generation += 1
+        if self._signing_key_cache is not None:
+            self._signing_key_cache.cache_clear()
         return jwk_set
 
     def get_jwk_set(self, refresh: bool = False) -> PyJWKSet:
@@ -267,6 +285,11 @@ class PyJWKClient:
         from the endpoint and the lookup is retried once when the refresh
         cooldown permits it.
 
+        When the signing key cache is enabled (``cache_keys=True``), a
+        cached key is served only while the JWK Set it was resolved from
+        is still cached and unexpired; otherwise the key is resolved
+        against a freshly fetched JWK Set.
+
         :param kid: The key ID to look up.
         :type kid: str
         :returns: The matching signing key.
@@ -274,6 +297,31 @@ class PyJWKClient:
         :raises PyJWKClientError: If no matching key is found after
             refreshing.
         """
+        key_cache = self._signing_key_cache
+        if key_cache is not None:
+            version = self._signing_key_cache_version()
+            if version is not None:
+                return key_cache(kid, version)
+        return self._resolve_signing_key(kid)
+
+    def _signing_key_cache_version(self) -> int | None:
+        """Return the generation to key the signing key cache by.
+
+        Returns ``None`` — meaning the cache must be bypassed — when there
+        is no valid cached JWK Set to anchor key validity to. Without this
+        check, an LRU hit would suppress the fetch that retires a revoked
+        key, serving it indefinitely.
+        """
+        if self.jwk_set_cache is None or self.jwk_set_cache.get() is None:
+            return None
+        return self._jwk_set_generation
+
+    def _resolve_signing_key_cached(self, kid: str, version: int) -> PyJWK:
+        # `version` only participates in the LRU cache key; the resolution
+        # itself always goes through the currently cached JWK Set.
+        return self._resolve_signing_key(kid)
+
+    def _resolve_signing_key(self, kid: str) -> PyJWK:
         with self._client_lock:
             signing_keys = self.get_signing_keys()
             signing_key = self.match_kid(signing_keys, kid)

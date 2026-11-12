@@ -7,6 +7,15 @@ This project adheres to `Semantic Versioning <https://semver.org/>`__.
 `Unreleased <https://github.com/jpadilla/pyjwt/compare/2.15.1...HEAD>`__
 -------------------------------------------------------------------------
 
+Fixed
+~~~~~
+
+- Invalidate the ``PyJWKClient`` signing key cache (``cache_keys=True``)
+  when the JWK Set is refreshed or expires. Cached keys are now anchored
+  to the JWK Set they were resolved from, so a key removed at the JWKS
+  endpoint by rotation or revocation stops verifying tokens once the JWK
+  Set cache expires, instead of being served until the process restarts.
+
 Changed
 ~~~~~~~
 
